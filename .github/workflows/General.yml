@@ -1,0 +1,109 @@
+name: Universal CI Baseline
+
+on:
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write  # Needed for dependency-review-action
+
+jobs:
+  security-and-standards:
+    name: Security & Standards
+    runs-on: ubuntu-latest
+    timeout-minutes: 10  # Safety net
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false  # Security hardening
+
+      - name: Enforce PR Title Format
+        if: github.event_name == 'pull_request'
+        uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Scan for Secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Check for Merge Conflict Markers
+        run: |
+          echo "Checking for unresolved merge conflicts..."
+          if grep -rE "^<{7} |^={7}$|^>{7} " --include="*" --exclude-dir=".git" .; then
+            echo "❌ Found merge conflict markers!"
+            exit 1
+          fi
+          echo "✅ No conflict markers found"
+
+      - name: Check File Sizes
+        run: |
+          MAX_SIZE=$((${{ inputs.max-file-size-mb }} * 1024 * 1024))
+          LARGE_FILES=$(find . -type f -size +${MAX_SIZE}c -not -path "./.git/*" 2>/dev/null)
+          if [ -n "$LARGE_FILES" ]; then
+            echo "❌ Files larger than ${{ inputs.max-file-size-mb }}MB detected:"
+            echo "$LARGE_FILES"
+            exit 1
+          fi
+          echo "✅ All files under size limit"
+
+      - name: Dependency Vulnerability Scan
+        if: github.event_name == 'pull_request'
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          fail-on-scopes: runtime,development
+
+      - name: Verify Required Files
+        run: |
+          MISSING=0
+          for file in README.md .gitignore; do
+            if [ ! -f "$file" ]; then
+              echo "❌ Missing $file"
+              MISSING=1
+            else
+              echo "✅ Found $file"
+            fi
+          done
+          if [ $MISSING -eq 1 ]; then exit 1; fi
+
+  quality-and-linting:
+    name: Quality & Linting
+    needs: security-and-standards
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Lint GitHub Actions
+        uses: raven-actions/actionlint@v2
+
+      - name: Catch Typos
+        uses: codespell-project/actions-codespell@v2
+        with:
+          check_filenames: true
+          check_hidden: true
+          skip: "*.json,*.lock,./.git,node_modules,vendor"
+
+      - name: Check Documentation Links
+        uses: gaurav-nelson/github-action-markdown-link-check@v1
+
+      - name: Universal Super-Linter
+        uses: super-linter/super-linter@v5
+        env:
+          VALIDATE_ALL_CODEBASE: false
+          DEFAULT_BRANCH: main
+          GITHUB_TOKEN: ${{ github.token }}
